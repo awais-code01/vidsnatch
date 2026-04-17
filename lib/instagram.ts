@@ -2,130 +2,128 @@ import type { VideoInfo } from '@/types';
 
 const BROWSER_HEADERS = {
   'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   Accept:
-    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
   'Sec-Fetch-Dest': 'document',
   'Sec-Fetch-Mode': 'navigate',
   'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Upgrade-Insecure-Requests': '1',
-  'Cache-Control': 'max-age=0',
+  'Cache-Control': 'no-cache',
 };
 
 function extractShortcode(url: string): string | null {
-  // Match /p/, /reel/, /tv/, /reels/
   const match = url.match(/instagram\.com\/(?:p|reel|tv|reels)\/([A-Za-z0-9_-]+)/);
   return match ? match[1] : null;
 }
 
-async function tryOEmbedAPI(url: string): Promise<{ title?: string; thumbnail?: string }> {
-  try {
-    const apiUrl = `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(url)}`;
-    const res = await fetch(apiUrl, { headers: BROWSER_HEADERS });
-    if (res.ok) {
-      const data = await res.json();
-      return {
-        title: data.title,
-        thumbnail: data.thumbnail_url,
-      };
-    }
-  } catch {
-    // ignore
-  }
-  return {};
+function decodeHTMLEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x2F;/g, '/')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\\//g, '/');
 }
 
-async function tryInstaFetchAPI(url: string): Promise<VideoInfo | null> {
-  // Use instaloader-inspired public scrape approach
+/**
+ * Approach 1: Instagram embed page
+ * Works for public reels/posts without login.
+ */
+async function tryEmbedPage(shortcode: string, originalUrl: string): Promise<VideoInfo | null> {
+  const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
+
   try {
-    const shortcode = extractShortcode(url);
-    if (!shortcode) return null;
-
-    // Try Instagram's public GraphQL endpoint (no auth for public posts)
-    const gqlUrl = `https://www.instagram.com/graphql/query/?query_hash=b3055c01b4b222b8a47dc12b090e4e64&variables=${encodeURIComponent(
-      JSON.stringify({ shortcode })
-    )}`;
-
-    const res = await fetch(gqlUrl, {
+    const res = await fetch(embedUrl, {
       headers: {
         ...BROWSER_HEADERS,
-        'X-IG-App-ID': '936619743392459',
-        Referer: `https://www.instagram.com/p/${shortcode}/`,
+        Referer: 'https://www.instagram.com/',
+        'Sec-Fetch-Site': 'same-origin',
       },
     });
 
     if (!res.ok) return null;
+    const html = await res.text();
 
-    const json = await res.json();
-    const media = json?.data?.shortcode_media;
-    if (!media) return null;
+    // Extract video URL — Instagram embeds contain this in a JSON blob
+    const videoPatterns = [
+      /video_url":"(https:[^"]+)"/,
+      /"contentUrl":"(https:[^"]+)"/,
+      /property="og:video" content="([^"]+)"/,
+      /property="og:video:secure_url" content="([^"]+)"/,
+      /<video[^>]+src="([^"]+)"/,
+    ];
 
-    const formats = [];
-    const isVideo = media.__typename === 'GraphVideo' || media.is_video;
-
-    if (isVideo && media.video_url) {
-      formats.push({
-        quality: 'Best',
-        label: 'Best Quality • MP4',
-        url: media.video_url,
-        hasVideo: true,
-        hasAudio: true,
-        container: 'mp4',
-      });
+    let videoUrl: string | null = null;
+    for (const p of videoPatterns) {
+      const m = html.match(p);
+      if (m?.[1]) {
+        videoUrl = decodeHTMLEntities(m[1]);
+        break;
+      }
     }
 
-    // Carousel — check edge_sidecar_to_children
-    if (media.edge_sidecar_to_children) {
-      const edges = media.edge_sidecar_to_children.edges || [];
-      edges.forEach((edge: Record<string, unknown>, i: number) => {
-        const node = edge.node as Record<string, unknown>;
-        if (node && node.is_video && node.video_url) {
-          formats.push({
-            quality: `Video ${i + 1}`,
-            label: `Slide ${i + 1} • MP4`,
-            url: node.video_url as string,
-            hasVideo: true,
-            hasAudio: true,
-            container: 'mp4',
-          });
-        }
-      });
+    if (!videoUrl) return null;
+
+    // Extract thumbnail
+    const thumbPatterns = [
+      /property="og:image" content="([^"]+)"/,
+      /display_url":"(https:[^"]+)"/,
+      /thumbnail_src":"(https:[^"]+)"/,
+    ];
+    let thumbnail: string | undefined;
+    for (const p of thumbPatterns) {
+      const m = html.match(p);
+      if (m?.[1]) {
+        thumbnail = decodeHTMLEntities(m[1]);
+        break;
+      }
     }
 
-    if (formats.length === 0) return null;
-
-    const caption =
-      media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video';
+    // Extract title
+    const titleMatch =
+      html.match(/property="og:title" content="([^"]+)"/) ||
+      html.match(/<title>([^<]+)<\/title>/);
+    const title = titleMatch?.[1]
+      ? decodeHTMLEntities(titleMatch[1]).replace(' • Instagram', '').trim()
+      : 'Instagram Video';
 
     return {
-      originalUrl: url,
+      originalUrl,
       platform: 'instagram',
-      title: caption.length > 100 ? caption.slice(0, 97) + '...' : caption,
-      thumbnail:
-        media.display_url ||
-        media.thumbnail_src ||
-        media.display_resources?.[0]?.src,
-      author: media.owner?.username
-        ? `@${media.owner.username}`
-        : undefined,
-      formats,
+      title,
+      thumbnail,
+      formats: [
+        {
+          quality: 'Best',
+          label: 'Best Quality • MP4',
+          url: videoUrl,
+          hasVideo: true,
+          hasAudio: true,
+          container: 'mp4',
+        },
+      ],
     };
   } catch {
     return null;
   }
 }
 
+/**
+ * Approach 2: Scrape the main page OG tags
+ */
 async function tryOGScrape(url: string): Promise<VideoInfo | null> {
   try {
     const res = await fetch(url, {
       headers: BROWSER_HEADERS,
       redirect: 'follow',
     });
-
     if (!res.ok) return null;
+
     const html = await res.text();
 
     const videoMatch =
@@ -133,25 +131,22 @@ async function tryOGScrape(url: string): Promise<VideoInfo | null> {
       html.match(/<meta property="og:video" content="([^"]+)"/) ||
       html.match(/<meta name="twitter:player:stream" content="([^"]+)"/);
 
+    if (!videoMatch?.[1]) return null;
+
     const titleMatch =
       html.match(/<meta property="og:title" content="([^"]+)"/) ||
       html.match(/<title>([^<]+)<\/title>/);
-
     const thumbMatch =
       html.match(/<meta property="og:image" content="([^"]+)"/) ||
       html.match(/<meta name="twitter:image" content="([^"]+)"/);
-
-    if (!videoMatch?.[1]) return null;
 
     return {
       originalUrl: url,
       platform: 'instagram',
       title: titleMatch?.[1]
-        ? decodeHTMLEntities(titleMatch[1])
+        ? decodeHTMLEntities(titleMatch[1]).replace(' • Instagram', '').trim()
         : 'Instagram Video',
-      thumbnail: thumbMatch?.[1]
-        ? decodeHTMLEntities(thumbMatch[1])
-        : undefined,
+      thumbnail: thumbMatch?.[1] ? decodeHTMLEntities(thumbMatch[1]) : undefined,
       formats: [
         {
           quality: 'Best',
@@ -168,34 +163,76 @@ async function tryOGScrape(url: string): Promise<VideoInfo | null> {
   }
 }
 
-function decodeHTMLEntities(str: string): string {
-  return str
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x2F;/g, '/');
+/**
+ * Approach 3: Try the /api/v1/media/{pk}/info/ approach via URL
+ * (works for some public content)
+ */
+async function tryDirectMediaFetch(url: string): Promise<VideoInfo | null> {
+  try {
+    // Extract media ID from URL if present
+    const pkMatch = url.match(/\/(\d{17,19})\/?/);
+    if (!pkMatch) return null;
+
+    const mediaId = pkMatch[1];
+    const apiUrl = `https://www.instagram.com/api/v1/media/${mediaId}/info/`;
+
+    const res = await fetch(apiUrl, {
+      headers: {
+        ...BROWSER_HEADERS,
+        'X-IG-App-ID': '936619743392459',
+        'X-ASBD-ID': '129477',
+        Referer: url,
+      },
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    const item = data?.items?.[0];
+    if (!item) return null;
+
+    const formats = [];
+
+    if (item.video_versions?.length > 0) {
+      const best = item.video_versions[0];
+      formats.push({
+        quality: 'Best',
+        label: 'Best Quality • MP4',
+        url: best.url,
+        hasVideo: true,
+        hasAudio: true,
+        container: 'mp4',
+      });
+    }
+
+    if (formats.length === 0) return null;
+
+    return {
+      originalUrl: url,
+      platform: 'instagram',
+      title: item.caption?.text?.slice(0, 100) || 'Instagram Video',
+      thumbnail: item.image_versions2?.candidates?.[0]?.url,
+      author: item.user?.username ? `@${item.user.username}` : undefined,
+      formats,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function getInstagramInfo(url: string): Promise<VideoInfo> {
-  // Try GraphQL first
-  const graphResult = await tryInstaFetchAPI(url);
-  if (graphResult && graphResult.formats.length > 0) {
-    return graphResult;
+  const shortcode = extractShortcode(url);
+
+  // Try all approaches in order
+  if (shortcode) {
+    const embed = await tryEmbedPage(shortcode, url);
+    if (embed && embed.formats.length > 0) return embed;
   }
 
-  // Try OG scrape fallback
-  const ogResult = await tryOGScrape(url);
-  if (ogResult && ogResult.formats.length > 0) {
-    // Enhance with oembed meta
-    const meta = await tryOEmbedAPI(url);
-    return {
-      ...ogResult,
-      title: meta.title || ogResult.title,
-      thumbnail: meta.thumbnail || ogResult.thumbnail,
-    };
-  }
+  const direct = await tryDirectMediaFetch(url);
+  if (direct && direct.formats.length > 0) return direct;
+
+  const og = await tryOGScrape(url);
+  if (og && og.formats.length > 0) return og;
 
   return {
     originalUrl: url,
@@ -203,6 +240,6 @@ export async function getInstagramInfo(url: string): Promise<VideoInfo> {
     title: 'Instagram Video',
     formats: [],
     error:
-      'Could not fetch Instagram video. Make sure the post is public and the URL is correct. Instagram may require login for some content.',
+      'Could not download this Instagram video. Instagram heavily restricts server-side access. Make sure: (1) The post is public, (2) The URL is a direct reel/post link (not a profile or story). Private posts require login and cannot be downloaded.',
   };
 }
