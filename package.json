@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "vercel-build": "YOUTUBE_DL_SKIP_DOWNLOAD=true node scripts/download-ytdlp.js && next build",
     "start": "next start",
     "lint": "next lint"
   },

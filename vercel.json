@@ -1,7 +1,9 @@
 {
+  "buildCommand": "npm run vercel-build",
   "functions": {
     "app/api/info/route.ts": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "includeFiles": "node_modules/yt-dlp-exec/bin/**"
     },
     "app/api/proxy/route.ts": {
       "maxDuration": 60
