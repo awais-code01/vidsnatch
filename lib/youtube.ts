@@ -1,147 +1,109 @@
-import { Innertube } from 'youtubei.js';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const ytDlp = require('yt-dlp-exec') as (
+  url: string,
+  flags?: Record<string, unknown>
+) => Promise<unknown>;
 import type { VideoInfo, VideoFormat } from '@/types';
 import { formatDuration, formatBytes } from './detect';
 
-function extractVideoId(url: string): string | null {
-  const patterns = [
-    /[?&]v=([A-Za-z0-9_-]{11})/,
-    /youtu\.be\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/embed\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/shorts\/([A-Za-z0-9_-]{11})/,
-    /youtube\.com\/v\/([A-Za-z0-9_-]{11})/,
-  ];
-  for (const p of patterns) {
-    const m = url.match(p);
-    if (m) return m[1];
-  }
-  return null;
+interface YtDlpFormat {
+  format_id: string;
+  format_note?: string;
+  ext: string;
+  url: string;
+  width?: number;
+  height?: number;
+  vcodec?: string;
+  acodec?: string;
+  tbr?: number;
+  abr?: number;
+  vbr?: number;
+  filesize?: number;
+  filesize_approx?: number;
+  audio_ext?: string;
+  video_ext?: string;
 }
 
+interface YtDlpResult {
+  id: string;
+  title: string;
+  thumbnail?: string;
+  thumbnails?: Array<{ url: string; width?: number; height?: number }>;
+  uploader?: string;
+  channel?: string;
+  duration?: number;
+  formats: YtDlpFormat[];
+}
+
+const QUALITY_ORDER = ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'];
+
 export async function getYouTubeInfo(url: string): Promise<VideoInfo> {
-  const videoId = extractVideoId(url);
-
-  if (!videoId) {
-    return {
-      originalUrl: url,
-      platform: 'youtube',
-      title: 'YouTube Video',
-      formats: [],
-      error: 'Could not extract video ID from URL. Make sure the URL is a valid YouTube video link.',
-    };
-  }
-
   try {
-    const yt = await Innertube.create({
-      lang: 'en',
-      location: 'US',
-      retrieve_player: true,
-      generate_session_locally: true,
-      fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
-    });
-
-    const info = await yt.getInfo(videoId);
-    const basic = info.basic_info;
-    const streaming = info.streaming_data;
-
-    if (!streaming) {
-      throw new Error('No streaming data available for this video.');
-    }
+    const result = (await ytDlp(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      preferFreeFormats: true,
+      youtubeSkipDashManifest: true,
+      addHeaders: [
+        'User-Agent:Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+      ],
+    })) as unknown as YtDlpResult;
 
     const formats: VideoFormat[] = [];
 
-    // Combined video+audio formats (muxed)
-    const muxed = streaming.formats ?? [];
-    const qualityOrder = ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'];
-    muxed.sort((a, b) => {
-      const al = (a as { quality_label?: string }).quality_label ?? '';
-      const bl = (b as { quality_label?: string }).quality_label ?? '';
-      return (qualityOrder.indexOf(al) === -1 ? 99 : qualityOrder.indexOf(al)) -
-             (qualityOrder.indexOf(bl) === -1 ? 99 : qualityOrder.indexOf(bl));
-    });
+    // Combined video+audio formats
+    const combined = result.formats.filter(
+      (f) =>
+        f.vcodec !== 'none' &&
+        f.acodec !== 'none' &&
+        f.url &&
+        !f.url.startsWith('manifest') &&
+        f.ext !== 'mhtml'
+    );
 
-    const seenMuxed = new Set<string>();
-    for (const fmt of muxed) {
-      const f = fmt as Record<string, unknown>;
-      const label = (f.quality_label as string) ?? 'Unknown';
-      if (seenMuxed.has(label)) continue;
-      seenMuxed.add(label);
+    // Deduplicate by height
+    const seenHeight = new Set<number>();
+    combined.sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+    for (const fmt of combined) {
+      const h = fmt.height ?? 0;
+      if (h > 0 && seenHeight.has(h)) continue;
+      if (h > 0) seenHeight.add(h);
 
-      const rawUrl = f.url as string | undefined;
-      if (!rawUrl) continue;
-
-      const size = f.content_length
-        ? formatBytes(Number(f.content_length))
-        : undefined;
-
+      const quality = h > 0 ? `${h}p` : fmt.format_note ?? 'Unknown';
+      const size = fmt.filesize ?? fmt.filesize_approx;
       formats.push({
-        quality: label,
-        label: `${label} • MP4 • Video+Audio`,
-        url: rawUrl,
-        mimeType: f.mime_type as string | undefined,
-        size,
+        quality,
+        label: `${quality} • ${fmt.ext.toUpperCase()} • Video+Audio`,
+        url: fmt.url,
+        size: size ? formatBytes(size) : undefined,
         hasVideo: true,
         hasAudio: true,
-        container: 'mp4',
+        container: fmt.ext,
       });
     }
 
-    // Adaptive (video-only) — top 3 unique qualities
-    const adaptive = streaming.adaptive_formats ?? [];
-    const videoOnly = adaptive.filter((f) => {
-      const fObj = f as Record<string, unknown>;
-      const mime = (fObj.mime_type as string) ?? '';
-      return mime.startsWith('video/') && fObj.url;
+    // Sort by quality order
+    formats.sort((a, b) => {
+      const ai = QUALITY_ORDER.indexOf(a.quality);
+      const bi = QUALITY_ORDER.indexOf(b.quality);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
     });
-    videoOnly.sort((a, b) => {
-      const al = ((a as Record<string, unknown>).quality_label as string) ?? '';
-      const bl = ((b as Record<string, unknown>).quality_label as string) ?? '';
-      return (qualityOrder.indexOf(al) === -1 ? 99 : qualityOrder.indexOf(al)) -
-             (qualityOrder.indexOf(bl) === -1 ? 99 : qualityOrder.indexOf(bl));
-    });
-    const seenVideo = new Set<string>();
-    for (const fmt of videoOnly.slice(0, 5)) {
-      const f = fmt as Record<string, unknown>;
-      const label = (f.quality_label as string) ?? 'Unknown';
-      if (seenVideo.has(label)) continue;
-      seenVideo.add(label);
-      formats.push({
-        quality: label,
-        label: `${label} • Video Only (No Audio)`,
-        url: f.url as string,
-        mimeType: f.mime_type as string | undefined,
-        hasVideo: true,
-        hasAudio: false,
-      });
-    }
 
     // Best audio-only format
-    const audioOnly = adaptive.filter((f) => {
-      const fObj = f as Record<string, unknown>;
-      const mime = (fObj.mime_type as string) ?? '';
-      return mime.startsWith('audio/') && fObj.url;
-    });
-    if (audioOnly.length > 0) {
-      const best = audioOnly.sort(
-        (a, b) =>
-          ((b as Record<string, unknown>).bitrate as number ?? 0) -
-          ((a as Record<string, unknown>).bitrate as number ?? 0)
-      )[0] as Record<string, unknown>;
-
-      const bitrate = best.bitrate
-        ? `${Math.round((best.bitrate as number) / 1000)}kbps`
-        : 'Best';
-
+    const audioFormats = result.formats.filter(
+      (f) => f.vcodec === 'none' && f.acodec !== 'none' && f.url
+    );
+    if (audioFormats.length > 0) {
+      const best = audioFormats.sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
       formats.push({
         quality: 'Audio',
-        label: `Audio Only • ${bitrate} • AAC`,
-        url: best.url as string,
-        mimeType: best.mime_type as string | undefined,
-        size: best.content_length
-          ? formatBytes(Number(best.content_length))
-          : undefined,
+        label: `Audio Only • ${best.abr ? `${Math.round(best.abr)}kbps` : 'Best'} • ${best.ext.toUpperCase()}`,
+        url: best.url,
         isAudioOnly: true,
         hasVideo: false,
         hasAudio: true,
+        container: best.ext,
       });
     }
 
@@ -149,26 +111,27 @@ export async function getYouTubeInfo(url: string): Promise<VideoInfo> {
       throw new Error('No downloadable formats found for this video.');
     }
 
-    const thumbs = (basic.thumbnail as Array<{ url: string; width?: number }>) ?? [];
-    const thumb = thumbs.sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]?.url;
+    const thumb =
+      result.thumbnails?.sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ??
+      result.thumbnail;
 
     return {
       originalUrl: url,
       platform: 'youtube',
-      title: (basic.title as string) ?? 'YouTube Video',
+      title: result.title,
       thumbnail: thumb,
-      duration: basic.duration ? formatDuration(basic.duration as number) : undefined,
-      author: basic.author as string | undefined,
+      duration: result.duration ? formatDuration(result.duration) : undefined,
+      author: result.channel ?? result.uploader,
       formats,
     };
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
+    const msg = err instanceof Error ? err.message : String(err);
     return {
       originalUrl: url,
       platform: 'youtube',
       title: 'YouTube Video',
       formats: [],
-      error: `Failed to fetch YouTube info: ${message}`,
+      error: `Failed to fetch YouTube info: ${msg}`,
     };
   }
 }
