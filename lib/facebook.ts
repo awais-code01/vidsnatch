@@ -2,43 +2,38 @@ import type { VideoInfo } from '@/types';
 
 const BROWSER_HEADERS = {
   'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  Accept:
-    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
   'Cache-Control': 'no-cache',
-  Pragma: 'no-cache',
 };
+
+function cleanFBUrl(raw: string): string {
+  return raw.replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/\\/g, '');
+}
 
 function decodeHTMLEntities(str: string): string {
   return str
     .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
     .replace(/\\u0026/g, '&')
-    .replace(/\\u003C/g, '<')
-    .replace(/\\u003E/g, '>')
-    .replace(/\\/g, '');
+    .replace(/\\\//g, '/');
 }
 
-function cleanFBUrl(url: string): string {
-  // Facebook escapes / as \/ in JS
-  return url.replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-}
-
-async function resolveFbWatchUrl(url: string): Promise<string> {
-  if (!url.includes('fb.watch')) return url;
+/** Resolve any short or redirect URL (fb.watch, share/r/, etc.) to its canonical form. */
+async function resolveUrl(url: string): Promise<string> {
+  if (!url.includes('fb.watch') && !url.includes('/share/') && !url.includes('m.me')) {
+    return url;
+  }
   try {
     const res = await fetch(url, {
-      method: 'GET',
+      method: 'HEAD',
       redirect: 'follow',
       headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(10_000),
     });
     return res.url || url;
   } catch {
@@ -46,22 +41,7 @@ async function resolveFbWatchUrl(url: string): Promise<string> {
   }
 }
 
-async function fetchFacebookPage(url: string): Promise<string> {
-  const res = await fetch(url, {
-    headers: {
-      ...BROWSER_HEADERS,
-      Cookie: 'locale=en_US; datr=; sb=',
-    },
-    redirect: 'follow',
-  });
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-  }
-  return res.text();
-}
-
-function extractVideoUrls(html: string): {
+function extractVideoData(html: string): {
   hd?: string;
   sd?: string;
   title?: string;
@@ -69,61 +49,52 @@ function extractVideoUrls(html: string): {
 } {
   const result: { hd?: string; sd?: string; title?: string; thumbnail?: string } = {};
 
-  // Method 1: JSON encoded in HTML
+  // Patterns for HD video URL — try in order of reliability
   const hdPatterns = [
     /"hd_src":"([^"]+)"/,
     /"hd_src_no_ratelimit":"([^"]+)"/,
+    /"browser_native_hd_url":"([^"]+)"/,
     /hd_src["\s]*:["\s]*"([^"]+\.mp4[^"]*)"/,
+    /"playable_url_quality_hd":"([^"]+)"/,
   ];
+
   const sdPatterns = [
     /"sd_src":"([^"]+)"/,
     /"sd_src_no_ratelimit":"([^"]+)"/,
+    /"browser_native_sd_url":"([^"]+)"/,
     /sd_src["\s]*:["\s]*"([^"]+\.mp4[^"]*)"/,
+    /"playable_url":"([^"]+)"/,
+    /<video[^>]+src="([^"]+\.mp4[^"]*)"/,
+    /<source[^>]+src="([^"]+\.mp4[^"]*)"/,
   ];
 
-  for (const pattern of hdPatterns) {
-    const m = html.match(pattern);
-    if (m?.[1]) {
-      result.hd = cleanFBUrl(m[1]);
-      break;
-    }
+  for (const p of hdPatterns) {
+    const m = html.match(p);
+    if (m?.[1] && m[1].includes('.mp4')) { result.hd = cleanFBUrl(m[1]); break; }
   }
 
-  for (const pattern of sdPatterns) {
-    const m = html.match(pattern);
-    if (m?.[1]) {
-      result.sd = cleanFBUrl(m[1]);
-      break;
-    }
+  for (const p of sdPatterns) {
+    const m = html.match(p);
+    if (m?.[1]) { result.sd = cleanFBUrl(m[1]); break; }
   }
 
-  // Method 2: og:video meta tags
+  // OG video as last resort
   if (!result.hd && !result.sd) {
     const ogVideo =
       html.match(/<meta property="og:video:secure_url" content="([^"]+)"/) ||
       html.match(/<meta property="og:video" content="([^"]+)"/);
-    if (ogVideo?.[1]) {
-      result.sd = decodeHTMLEntities(ogVideo[1]);
-    }
-  }
-
-  // Method 3: playable_url in JSON blobs
-  if (!result.hd && !result.sd) {
-    const playableHd = html.match(/"playable_url_quality_hd":"([^"]+)"/);
-    const playableSd = html.match(/"playable_url":"([^"]+)"/);
-    if (playableHd?.[1]) result.hd = cleanFBUrl(playableHd[1]);
-    if (playableSd?.[1]) result.sd = cleanFBUrl(playableSd[1]);
+    if (ogVideo?.[1]) result.sd = decodeHTMLEntities(ogVideo[1]);
   }
 
   // Title
   const titlePatterns = [
     /<meta property="og:title" content="([^"]+)"/,
-    /<title>([^<]+)<\/title>/,
     /"title":"([^"]+)"/,
+    /<title>([^<]+)<\/title>/,
   ];
-  for (const pattern of titlePatterns) {
-    const m = html.match(pattern);
-    if (m?.[1]) {
+  for (const p of titlePatterns) {
+    const m = html.match(p);
+    if (m?.[1] && m[1] !== 'Facebook') {
       result.title = decodeHTMLEntities(m[1]);
       break;
     }
@@ -134,25 +105,78 @@ function extractVideoUrls(html: string): {
     /<meta property="og:image" content="([^"]+)"/,
     /"thumbnail_url":"([^"]+)"/,
     /"preferred_thumbnail":\{"image":\{"uri":"([^"]+)"/,
+    /"thumbnailImage":\{"uri":"([^"]+)"/,
   ];
-  for (const pattern of thumbPatterns) {
-    const m = html.match(pattern);
-    if (m?.[1]) {
-      result.thumbnail = decodeHTMLEntities(m[1]);
-      break;
-    }
+  for (const p of thumbPatterns) {
+    const m = html.match(p);
+    if (m?.[1]) { result.thumbnail = decodeHTMLEntities(m[1]); break; }
   }
 
   return result;
 }
 
+/** Fetch Facebook with standard browser headers. */
+async function fetchFacebookPage(url: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: {
+      ...BROWSER_HEADERS,
+      Cookie: 'locale=en_US; datr=; sb=; c_user=0',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
+/** Try mbasic.facebook.com — simpler HTML, less JS, often exposes video URLs directly. */
+async function tryMbasic(url: string): Promise<ReturnType<typeof extractVideoData>> {
+  try {
+    const mUrl = url
+      .replace('www.facebook.com', 'mbasic.facebook.com')
+      .replace('m.facebook.com', 'mbasic.facebook.com');
+
+    const res = await fetch(mUrl, {
+      headers: {
+        ...BROWSER_HEADERS,
+        Cookie: 'locale=en_US',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) return {};
+    return extractVideoData(await res.text());
+  } catch {
+    return {};
+  }
+}
+
 export async function getFacebookInfo(url: string): Promise<VideoInfo> {
   try {
-    // Resolve fb.watch short URLs
-    const resolvedUrl = await resolveFbWatchUrl(url);
+    const resolvedUrl = await resolveUrl(url);
 
-    const html = await fetchFacebookPage(resolvedUrl);
-    const extracted = extractVideoUrls(html);
+    // Try www first, then mbasic fallback
+    let extracted = extractVideoData(await fetchFacebookPage(resolvedUrl));
+
+    if (!extracted.hd && !extracted.sd) {
+      extracted = await tryMbasic(resolvedUrl);
+    }
+
+    // If still nothing and URL contains a video ID, try /video/{id} directly
+    if (!extracted.hd && !extracted.sd) {
+      const vidId = resolvedUrl.match(/\/videos\/(\d+)/)?.[1] ||
+                    resolvedUrl.match(/[?&]v=(\d+)/)?.[1] ||
+                    resolvedUrl.match(/story_fbid=(\d+)/)?.[1];
+      if (vidId) {
+        try {
+          const directHtml = await fetchFacebookPage(`https://www.facebook.com/video/${vidId}`);
+          extracted = extractVideoData(directHtml);
+        } catch { /* ignore */ }
+      }
+    }
 
     const formats = [];
 
@@ -186,7 +210,7 @@ export async function getFacebookInfo(url: string): Promise<VideoInfo> {
         thumbnail: extracted.thumbnail,
         formats: [],
         error:
-          'Could not extract video URL from this Facebook post. The video may be private, from a group, or Facebook may have changed their page structure. Try making the video public.',
+          'Could not extract video URL. Make sure the video is public. Facebook\'s page structure changes frequently — this may work for some videos but not others.',
       };
     }
 
