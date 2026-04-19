@@ -1,50 +1,74 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { Innertube } from 'youtubei.js';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
 
-function mimeToExt(mime: string): string {
-  const base = mime.split('/')[1]?.split(';')[0] ?? '';
-  return base === 'webm' ? 'webm' : 'mp4';
+function extractVideoId(url: string): string | null {
+  const patterns = [
+    /[?&]v=([a-zA-Z0-9_-]{11})/,
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    /\/embed\/([a-zA-Z0-9_-]{11})/,
+    /\/shorts\/([a-zA-Z0-9_-]{11})/,
+    /\/v\/([a-zA-Z0-9_-]{11})/,
+  ];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m?.[1]) return m[1];
+  }
+  return null;
 }
 
-type RawFmt = {
-  itag?: number;
-  mime_type?: string;
+type InnerTubeFormat = {
+  itag: number;
   url?: string;
-  decipher?: (player: unknown) => string;
+  mimeType?: string;
   bitrate?: number;
-  average_bitrate?: number;
   width?: number;
   height?: number;
-  content_length?: string | number;
+  contentLength?: string;
+  averageBitrate?: number;
 };
 
-function getFmtUrl(fmt: RawFmt, player: unknown): string {
-  if (fmt.url) return fmt.url;
-  if (typeof fmt.decipher === 'function' && player) {
-    try { return fmt.decipher(player); } catch { /* fall through */ }
-  }
-  return '';
-}
-
-function buildFormat(fmt: RawFmt, player: unknown) {
-  const mime = fmt.mime_type ?? '';
-  const url = getFmtUrl(fmt, player);
-  if (!url || url.includes('manifest')) return null;
-  return {
-    format_id: String(fmt.itag ?? ''),
-    ext: mimeToExt(mime),
-    url,
-    height: typeof fmt.height === 'number' ? fmt.height : undefined,
-    width: typeof fmt.width === 'number' ? fmt.width : undefined,
-    vcodec: fmt.width != null ? 'avc1' : 'none',
-    acodec: mime.includes('mp4a') || mime.includes('opus') ? 'mp4a' : 'none',
-    tbr: typeof fmt.bitrate === 'number' ? fmt.bitrate / 1000 : undefined,
-    abr: typeof fmt.average_bitrate === 'number' ? fmt.average_bitrate / 1000 : undefined,
-    filesize: fmt.content_length != null ? Number(fmt.content_length) : undefined,
+async function fetchInnerTube(videoId: string, clientName: string, clientVersion: string, clientData: Record<string, unknown>) {
+  const body = {
+    videoId,
+    context: {
+      client: {
+        clientName,
+        clientVersion,
+        hl: 'en',
+        gl: 'US',
+        utcOffsetMinutes: 0,
+        ...clientData,
+      },
+    },
   };
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Origin: 'https://www.youtube.com',
+    Referer: 'https://www.youtube.com/',
+  };
+
+  if (clientName === 'ANDROID') {
+    headers['User-Agent'] = 'com.google.android.youtube/19.02.39 (Linux; U; Android 11) gzip';
+    headers['X-Youtube-Client-Name'] = '3';
+    headers['X-Youtube-Client-Version'] = clientVersion;
+  } else {
+    headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    headers['X-Youtube-Client-Name'] = '56';
+    headers['X-Youtube-Client-Version'] = clientVersion;
+  }
+
+  const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) throw new Error(`InnerTube HTTP ${res.status}`);
+  return res.json();
 }
 
 export async function POST(request: NextRequest) {
@@ -54,35 +78,83 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Missing url' }, { status: 400 });
     }
 
-    const yt = await Innertube.create({ generate_session_locally: true });
-    const info = await yt.getBasicInfo(url);
-
-    if (!info.basic_info?.id) {
-      return NextResponse.json({ error: 'Video not found or unavailable' }, { status: 404 });
+    const videoId = extractVideoId(url);
+    if (!videoId) {
+      return NextResponse.json({ error: 'Could not extract video ID from URL' }, { status: 400 });
     }
 
-    const sd = info.streaming_data;
-    if (!sd) {
-      return NextResponse.json({ error: 'No streaming data available' }, { status: 404 });
+    // Try Android client first — returns direct CDN URLs without cipher encryption
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = await fetchInnerTube(videoId, 'ANDROID', '19.02.39', {
+        androidSdkVersion: 30,
+        userAgent: 'com.google.android.youtube/19.02.39 (Linux; U; Android 11) gzip',
+      });
+    } catch { /* fall through to web client */ }
+
+    // Fall back to TVHTML5_SIMPLY_EMBEDDED_PLAYER — also returns direct URLs
+    if (!data || (data.playabilityStatus as Record<string, unknown>)?.status !== 'OK') {
+      try {
+        data = await fetchInnerTube(videoId, 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', '2.0', {
+          clientScreen: 'EMBED',
+        });
+      } catch { /* ignore */ }
     }
 
-    const player = yt.session.player;
-    const formats = [...sd.formats, ...sd.adaptive_formats]
-      .map((f) => buildFormat(f as unknown as RawFmt, player))
-      .filter((f): f is NonNullable<typeof f> => f !== null);
+    if (!data) {
+      return NextResponse.json({ error: 'Failed to contact YouTube API' }, { status: 502 });
+    }
 
-    const thumbnails = (info.basic_info.thumbnail ?? [])
-      .map((t) => ({ url: t.url, width: t.width, height: t.height }))
-      .sort((a, b) => (b.width ?? 0) - (a.width ?? 0));
+    const ps = data?.playabilityStatus as Record<string, unknown> | undefined;
+    const status = ps?.status as string | undefined;
+    if (status && status !== 'OK') {
+      const reason = ps?.reason as string | undefined;
+      return NextResponse.json({ error: reason ?? `Video unavailable (${status})` }, { status: 403 });
+    }
+
+    const vd = (data?.videoDetails ?? {}) as Record<string, unknown>;
+    const sd = (data?.streamingData ?? {}) as Record<string, unknown>;
+
+    const muxed = (sd.formats ?? []) as InnerTubeFormat[];
+    const adaptive = (sd.adaptiveFormats ?? []) as InnerTubeFormat[];
+
+    const formats = [...muxed, ...adaptive]
+      .filter((f) => f.url && !f.url.includes('manifest'))
+      .map((f) => {
+        const mime = f.mimeType ?? '';
+        const ext = mime.split('/')[1]?.split(';')[0] ?? 'mp4';
+        const hasV = f.width != null;
+        const hasA = mime.includes('mp4a') || mime.includes('opus') || !hasV;
+        return {
+          format_id: String(f.itag),
+          ext,
+          url: f.url!,
+          height: f.height,
+          width: f.width,
+          vcodec: hasV ? 'avc1' : 'none',
+          acodec: hasA ? 'mp4a' : 'none',
+          tbr: f.bitrate != null ? f.bitrate / 1000 : undefined,
+          abr: f.averageBitrate != null ? f.averageBitrate / 1000 : undefined,
+          filesize: f.contentLength != null ? Number(f.contentLength) : undefined,
+        };
+      });
+
+    const thumbnails = (
+      ((vd.thumbnail as Record<string, unknown>)?.thumbnails as Array<{
+        url: string;
+        width?: number;
+        height?: number;
+      }>) ?? []
+    ).sort((a, b) => (b.width ?? 0) - (a.width ?? 0));
 
     return NextResponse.json({
-      id: info.basic_info.id,
-      title: info.basic_info.title ?? 'YouTube Video',
+      id: videoId,
+      title: (vd.title as string) ?? 'YouTube Video',
       thumbnail: thumbnails[0]?.url,
       thumbnails,
-      duration: info.basic_info.duration,
-      uploader: info.basic_info.author,
-      channel: info.basic_info.author,
+      duration: vd.lengthSeconds ? Number(vd.lengthSeconds) : undefined,
+      uploader: vd.author as string | undefined,
+      channel: vd.author as string | undefined,
       formats,
     });
   } catch (err) {
