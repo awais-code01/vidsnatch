@@ -2,6 +2,6 @@
   "functions": {
     "app/api/info/route.ts": { "maxDuration": 60 },
     "app/api/proxy/route.ts": { "maxDuration": 60 },
-    "api/ytinfo.py": { "maxDuration": 60 }
+    "app/api/ytinfo/route.ts": { "maxDuration": 60 }
   }
 }
