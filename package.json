@@ -9,9 +9,19 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
+    "@jerrycoder/instagram-api": "^2.5.9",
+    "@sasmeee/igdl": "^0.0.1-security",
+    "btch-downloader": "^6.0.27",
+    "instagram-url-direct": "^2.0.7",
+    "nayan-media-downloader": "^0.0.1-security",
     "next": "^16.2.4",
     "react": "^18",
-    "react-dom": "^18"
+    "react-dom": "^18",
+    "ruhend-scraper": "^10.0.1",
+    "snapsave-media-downloader": "^2.4.0",
+    "youtube-dl-exec": "^3.1.5",
+    "youtubei.js": "^17.0.1"
   },
   "devDependencies": {
     "@types/node": "^20",

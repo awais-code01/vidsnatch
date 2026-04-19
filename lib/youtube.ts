@@ -1,96 +1,77 @@
 import type { VideoInfo, VideoFormat } from '@/types';
-import { formatDuration, formatBytes } from './detect';
+import { formatDuration } from './detect';
+import { create } from 'youtube-dl-exec';
+import path from 'path';
+import { getCookiesPath } from './cookies';
 
-interface YtDlpFormat {
-  format_id: string;
-  ext: string;
-  url: string;
-  height?: number;
-  width?: number;
-  vcodec?: string;
-  acodec?: string;
-  tbr?: number;
-  abr?: number;
-  filesize?: number;
-  filesize_approx?: number;
-}
-
-interface YtDlpResult {
-  id: string;
-  title: string;
-  thumbnail?: string;
-  thumbnails?: Array<{ url: string; width?: number; height?: number }>;
-  uploader?: string;
-  channel?: string;
-  duration?: number;
-  formats: YtDlpFormat[];
-  error?: string;
-}
-
-const QUALITY_ORDER = ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'];
+// Fix for Next.js bundling path issues
+const binaryPath = path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp' + (process.platform === 'win32' ? '.exe' : ''));
+const ytdl = create(binaryPath);
 
 export async function getYouTubeInfo(url: string, baseUrl: string): Promise<VideoInfo> {
   try {
-    const res = await fetch(`${baseUrl}/api/ytinfo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-      signal: AbortSignal.timeout(55_000),
-    });
-
-    const result: YtDlpResult = await res.json();
-
-    if (!res.ok || result.error) {
-      throw new Error(result.error ?? `HTTP ${res.status}`);
-    }
+    const cookiesPath = getCookiesPath();
+    const output = await ytdl(url, {
+      dumpSingleJson: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+      ...(cookiesPath ? { cookies: cookiesPath } : {})
+    }) as any;
 
     const formats: VideoFormat[] = [];
 
-    // Combined video+audio
-    const combined = result.formats.filter(
-      (f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.url
-    );
-    combined.sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+    if (output.formats && output.formats.length > 0) {
+      // 1. Pre-muxed (Video + Audio) - maxes out at 720p on YouTube
+      const preMuxed = output.formats.filter((f: any) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4');
+      for (const f of preMuxed) {
+        formats.push({
+          quality: f.height ? `${f.height}p` : 'Best',
+          label: `${f.height ? `${f.height}p` : 'Best'} • MP4`,
+          url: f.url,
+          hasVideo: true,
+          hasAudio: true,
+          container: 'mp4',
+        });
+      }
 
-    const seenH = new Set<number>();
-    for (const fmt of combined) {
-      const h = fmt.height ?? 0;
-      if (h > 0 && seenH.has(h)) continue;
-      if (h > 0) seenH.add(h);
-      const quality = h > 0 ? `${h}p` : 'Best';
-      const size = fmt.filesize ?? fmt.filesize_approx;
-      formats.push({
-        quality,
-        label: `${quality} • ${fmt.ext.toUpperCase()} • Video+Audio`,
-        url: fmt.url,
-        size: size ? formatBytes(size) : undefined,
-        hasVideo: true,
-        hasAudio: true,
-        container: fmt.ext,
-      });
+      // 2. High-Res DASH (Video Only) - 1080p, 1440p, 2160p (4K)
+      const dashVideo = output.formats.filter((f: any) => f.vcodec !== 'none' && f.acodec === 'none' && f.ext === 'mp4' && f.height > 720);
+      for (const f of dashVideo) {
+        formats.push({
+          quality: `${f.height}p`,
+          label: `${f.height}p • MP4 (No Audio)`,
+          url: f.url,
+          hasVideo: true,
+          hasAudio: false,
+          container: 'mp4',
+        });
+      }
+
+      // 3. Audio Only
+      const audioFormats = output.formats.filter((f: any) => f.vcodec === 'none' && f.acodec !== 'none');
+      if (audioFormats.length > 0) {
+        const bestAudio = audioFormats.sort((a: any, b: any) => (b.abr || 0) - (a.abr || 0))[0];
+        formats.push({
+          quality: 'Audio',
+          label: `Audio Only • ${Math.round(bestAudio.abr || 128)}kbps`,
+          url: bestAudio.url,
+          isAudioOnly: true,
+          hasVideo: false,
+          hasAudio: true,
+          container: bestAudio.ext || 'm4a',
+        });
+      }
     }
 
-    // Sort by known quality order
-    formats.sort((a, b) => {
-      const ai = QUALITY_ORDER.indexOf(a.quality);
-      const bi = QUALITY_ORDER.indexOf(b.quality);
-      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-    });
-
-    // Best audio-only
-    const audioOnly = result.formats.filter(
-      (f) => f.vcodec === 'none' && f.acodec !== 'none' && f.url
-    );
-    if (audioOnly.length > 0) {
-      const best = audioOnly.sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
+    if (formats.length === 0 && output.url) {
       formats.push({
-        quality: 'Audio',
-        label: `Audio Only • ${best.abr ? `${Math.round(best.abr)}kbps` : 'Best'} • ${best.ext.toUpperCase()}`,
-        url: best.url,
-        isAudioOnly: true,
-        hasVideo: false,
+        quality: 'Best',
+        label: `Best Quality • ${output.ext?.toUpperCase() || 'MP4'}`,
+        url: output.url,
+        hasVideo: true,
         hasAudio: true,
-        container: best.ext,
+        container: output.ext || 'mp4',
       });
     }
 
@@ -98,27 +79,34 @@ export async function getYouTubeInfo(url: string, baseUrl: string): Promise<Vide
       throw new Error('No downloadable formats found for this video.');
     }
 
-    const thumb =
-      (result.thumbnails ?? []).sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ??
-      result.thumbnail;
+    // Deduplicate by resolution and sort
+    const uniqueFormats = Array.from(new Map(formats.map(item => [item.quality, item])).values());
+    uniqueFormats.sort((a, b) => {
+      if (a.quality === 'Audio') return 1;
+      if (b.quality === 'Audio') return -1;
+      const hA = parseInt(a.quality) || 0;
+      const hB = parseInt(b.quality) || 0;
+      return hB - hA;
+    });
 
     return {
       originalUrl: url,
       platform: 'youtube',
-      title: result.title,
-      thumbnail: thumb,
-      duration: result.duration ? formatDuration(result.duration) : undefined,
-      author: result.channel ?? result.uploader,
-      formats,
+      title: output.title || 'YouTube Video',
+      thumbnail: output.thumbnail,
+      duration: output.duration ? formatDuration(output.duration) : undefined,
+      author: output.uploader,
+      formats: uniqueFormats,
     };
   } catch (err: unknown) {
+    console.error('youtube-dl-exec error:', err);
     const msg = err instanceof Error ? err.message : String(err);
     return {
       originalUrl: url,
       platform: 'youtube',
       title: 'YouTube Video',
       formats: [],
-      error: `Failed to fetch YouTube info: ${msg}`,
+      error: `Failed to fetch YouTube info: ${msg.split('\n')[0]}`,
     };
   }
 }
