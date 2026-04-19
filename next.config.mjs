@@ -28,6 +28,7 @@ const nextConfig = {
         ],
       },
     ];
+  },
   experimental: {
     serverComponentsExternalPackages: ['youtube-dl-exec'],
   },
